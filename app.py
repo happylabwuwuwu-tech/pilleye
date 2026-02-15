@@ -3,55 +3,47 @@ import cv2
 import numpy as np
 from PIL import Image
 
-def process_image(image, sensitivity, min_dist_scale):
+def detect_circles_metal(image, min_dist, param1, param2, min_radius, max_radius):
     # 1. 轉成 OpenCV 格式
     img_cv = np.array(image)
+    output_img = img_cv.copy()
+    
     if img_cv.shape[2] == 4:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2RGB)
     
-    # 2. 轉灰階並增強對比 (CLAHE) - 讓藥丸跟背景分更開
+    # 2. 轉灰階
     gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
+    
+    # [金屬盤專用] 3. CLAHE 對比度增強 
+    # 這能讓白色藥丸從銀色盤子上「跳」出來
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
-
-    # 3. 二值化 (閾值處理)
-    # 這裡用 slider 的數值來決定「多亮的東西才算藥丸」
-    _, thresh = cv2.threshold(gray, sensitivity, 255, cv2.THRESH_BINARY_INV)
-
-    # 4. 去除雜訊 (開運算) - 把小的反光點吃掉
-    kernel = np.ones((3,3), np.uint8)
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-
-    # 5. 確保背景是乾淨的 (膨脹)
-    sure_bg = cv2.dilate(opening, kernel, iterations=3)
-
-    # 6. 找中心點 (距離變換) - 這是分開沾黏藥丸的關鍵
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    gray_enhanced = clahe.apply(gray)
     
-    # 7. 根據中心點的「高峰」來決定哪裡是藥丸的核心
-    # min_dist_scale 越小，越容易把黏在一起的算成多顆
-    _, sure_fg = cv2.threshold(dist_transform, min_dist_scale * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-
-    # 8. 算數量
-    contours, _ = cv2.findContours(sure_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 4. 模糊化 (去除金屬髮絲紋與刮痕)
+    gray_blurred = cv2.GaussianBlur(gray_enhanced, (9, 9), 2)
     
-    count = len(contours)
+    # 5. 霍夫圓變換
+    # param1 (新增): 邊緣偵測閾值。設得越高，只有非常明顯的邊緣才算（過濾反光）。
+    circles = cv2.HoughCircles(gray_blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=min_dist,
+                               param1=param1, param2=param2,
+                               minRadius=min_radius, maxRadius=max_radius)
     
-    # 畫圖 (只畫中心點，因為邊緣已經不準了)
-    output_img = img_cv.copy()
-    for c in contours:
-        (x, y, w, h) = cv2.boundingRect(c)
-        # 畫個紅點在中心
-        cv2.circle(output_img, (int(x+w/2), int(y+h/2)), 5, (0, 0, 255), -1)
-        # 畫個綠框
-        cv2.rectangle(output_img, (x-10, y-10), (x+w+10, y+h+10), (0, 255, 0), 2)
+    count = 0
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        count = len(circles[0, :])
+        
+        for i in circles[0, :]:
+            # 畫外圓 (綠色)
+            cv2.circle(output_img, (i[0], i[1]), i[2], (0, 255, 0), 2)
+            # 畫圓心 (紅色)
+            cv2.circle(output_img, (i[0], i[1]), 2, (0, 0, 255), 3)
 
-    return output_img, count, opening, dist_transform
+    return output_img, count, gray_blurred
 
 # --- 介面 ---
-st.title("💊 藥丸計數器 V2 (抗反光版)")
-st.info("💡 小撇步：如果藥丸在袋子裡，請盡量**拉平袋子**減少皺褶反光。")
+st.title("💊 藥丸計數器 V3.1 (金屬盤專用)")
+st.info("💡 針對**反光金屬盤**優化。請調整下方參數直到綠色圈圈剛好套住藥丸。")
 
 uploaded_file = st.file_uploader("上傳照片", type=["jpg", "png", "jpeg"])
 
@@ -60,23 +52,27 @@ if uploaded_file is not None:
     st.image(image, caption='原始圖片', use_column_width=True)
     
     st.write("---")
-    st.subheader("🎛️ 參數調整 (調到準為止)")
+    st.subheader("🎛️ 金屬盤參數調校")
     
     col1, col2 = st.columns(2)
     with col1:
-        # 控制二值化：數值越小，只有越深色的東西會被抓到（適合淺色藥丸深色背景）
-        # 如果是黃藥丸(淺)在深桌子上，通常要反過來，或調整這個值
-        thresh_val = st.slider("1. 顏色過濾閾值 (過濾背景)", 0, 255, 120)
-    with col2:
-        # 控制沾黏分離程度
-        dist_scale = st.slider("2. 分離沾黏強度 (越小分越細)", 0.1, 0.9, 0.5)
+        # 針對金屬反光，這個要調高！
+        param1 = st.slider("1. 邊緣銳利度 (抗反光)", 50, 200, 100, help="數值越高，越不容易被金屬反光騙，但太高會抓不到藥丸邊緣")
+        # 圓形判定
+        param2 = st.slider("2. 圓形嚴格度", 10, 100, 30, help="數值越小越敏感，數值越大越嚴格")
+        
+    col3, col4 = st.columns(2)
+    with col3:
+        min_dist = st.slider("3. 最小間距", 10, 100, 25)
+    with col4:
+        min_radius = st.slider("4. 最小藥丸半徑", 0, 50, 10)
+        max_radius = st.slider("5. 最大藥丸半徑", 20, 150, 60)
 
     if st.button('開始計算'):
-        result_img, count, debug_mask, debug_dist = process_image(image, thresh_val, dist_scale)
+        result_img, count, debug_gray = detect_circles_metal(image, min_dist, param1, param2, min_radius, max_radius)
         
         st.success(f"📊 估計數量： {count} 顆")
-        st.image(result_img, caption='計算結果 (紅點為判定核心)', use_column_width=True)
+        st.image(result_img, caption='計算結果', use_column_width=True)
         
-        with st.expander("👀 查看電腦看到了什麼 (除錯用)"):
-            st.write("這是電腦過濾後的黑白影像，藥丸應該要是白色的，背景是黑色的。如果這張圖很亂，請調整上面的「顏色過濾閾值」。")
-            st.image(debug_mask, caption='黑白遮罩', use_column_width=True, clamp=True)
+        with st.expander("👀 電腦看到的處理後影像 (檢查對比度)"):
+            st.image(debug_gray, caption='增強對比後的灰階圖', use_column_width=True, clamp=True)
